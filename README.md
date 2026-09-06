@@ -6,7 +6,7 @@ risk scoring → interactive Shiny dashboard.
 
 ## Dataset
 
-"Bank Customer Churn Prediction" — 10,000 customer records with the following raw columns:
+"Bank Customer Churn Prediction" 10,000 customer records with the following raw columns:
 
 | Column             | Description                                   |
 |--------------------|-----------------------------------------------|
@@ -21,7 +21,7 @@ risk scoring → interactive Shiny dashboard.
 | `credit_card`      | Has a credit card (0/1)                       |
 | `active_member`    | Active member flag (0/1)                      |
 | `estimated_salary` | Estimated annual salary                       |
-| `churn`            | Target — 1 = churned, 0 = retained            |
+| `churn`            | Target 1 = churned, 0 = retained              |
 
 The raw CSV is not committed to this repo (see `.gitignore`). Place your
 copy anywhere convenient and point `raw_path` at the top of
@@ -31,7 +31,7 @@ as the script.
 
 ## Two ways to run this
 
-- **`Bank_Churn_Full_Analysis.R`** — everything (cleaning → EDA → modeling →
+- **`Bank_Churn_Full_Analysis.R`** everything (cleaning → EDA → modeling →
   risk scoring) combined into **one single script**, run top to bottom.
   Use this if you just want one file to point to on GitHub.
 - **`scripts/00_run_pipeline.R` + `scripts/01-04`** the same logic split
@@ -89,14 +89,14 @@ rmarkdown::render("report/Bank_Churn_Analysis.Rmd")
 
 ## Methodology
 
-1. **Data cleaning** — type coercion, duplicate removal, median/mode
+1. **Data cleaning** type coercion, duplicate removal, median/mode
    imputation, derived features (`age_group`, `tenure_group`).
-2. **EDA** — churn rate cuts by country, gender, age, tenure, product count,
+2. **EDA** churn rate cuts by country, gender, age, tenure, product count,
    activity status, credit card ownership; correlation analysis vs. churn.
-3. **Modeling** — Random Forest, XGBoost, Decision Tree, Logistic Regression,
+3. **Modeling** Random Forest, XGBoost, Decision Tree, Logistic Regression,
    and KNN, each tuned with 5-fold cross-validation, compared on Accuracy,
    Kappa, Sensitivity, Specificity, and AUC.
-4. **Risk scoring** — the best model (by AUC) scores every customer with a
+4. **Risk scoring** the best model (by AUC) scores every customer with a
    churn probability, bucketed into Low/Medium/High risk tiers, plus a
    decile/lift analysis showing how much value a retention team gets from
    acting on the highest-risk decile vs. random targeting.
@@ -105,10 +105,10 @@ rmarkdown::render("report/Bank_Churn_Analysis.Rmd")
    > dimension (no dates, no repeated observations per customer), so a
    > classical time-series forecast (ARIMA, ETS, etc.) doesn't apply. The
    > standard substitute used across churn-analytics portfolios is predictive
-   > risk scoring — ranking *current* customers by their probability of
+   > risk scoring ranking *current* customers by their probability of
    > churning next, which is what `04_risk_scoring.R` and the dashboard's
    > "Risk Scoring" and "What-If Predictor" tabs do.
-5. **Dashboard** — five tabs: Overview (KPIs), Explore (filterable EDA),
+5. **Dashboard** five tabs: Overview (KPIs), Explore (filterable EDA),
    Model Comparison, Risk Scoring (with lift chart + downloadable list), and
    a What-If Predictor for scoring a hypothetical customer profile live.
 
