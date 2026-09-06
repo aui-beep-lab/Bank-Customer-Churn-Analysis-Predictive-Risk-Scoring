@@ -1,0 +1,456 @@
+---
+title: 'Bank Customer Churn: Analysis & Predictive Risk Scoring'
+author: "Mohammad Arif Ul Islam"
+date: "2026-09-06"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+
+required_pkgs <- c("tidyverse", "janitor", "caret", "randomForest", "xgboost",
+                    "rpart", "pROC", "corrplot", "scales", "patchwork")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs) > 0) install.packages(new_pkgs, dependencies = TRUE)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(caret)
+  library(randomForest)
+  library(xgboost)
+  library(rpart)
+  library(pROC)
+  library(corrplot)
+  library(scales)
+  library(patchwork)
+})
+
+set.seed(123)
+
+white_theme <- theme_minimal(base_size = 12) +
+  theme(
+    panel.background  = element_rect(fill = "white", color = NA),
+    plot.background   = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    panel.grid.minor  = element_blank()
+  )
+theme_set(white_theme)
+
+dir.create("data/processed",  showWarnings = FALSE, recursive = TRUE)
+dir.create("models",          showWarnings = FALSE, recursive = TRUE)
+dir.create("outputs/figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("outputs/tables",  showWarnings = FALSE, recursive = TRUE)
+
+save_plot <- function(plot, name, width = 7, height = 5) {
+  print(plot)
+  ggsave(file.path("outputs/figures", paste0(name, ".png")),
+         plot = plot, width = width, height = height, dpi = 150, bg = "white")
+}
+
+save_base_plot <- function(expr, name, width = 1000, height = 800, res = 150) {
+  expr
+  dev.copy(png, file.path("outputs/figures", name), width = width, height = height, res = res, bg = "white")
+  dev.off()
+}
+```
+
+```{r}
+# ==============================================================================
+# 1. DATA UNDERSTANDING & PREPARATION
+# ==============================================================================
+
+# ---- 1. Load raw data --------------------------------------------------------
+# Point this at your CSV file — edit the path below to match wherever your
+# file actually lives. Default assumes it sits in the same folder as this
+# script.
+raw_path <- file.choose()   # opens a file picker — navigate to and select your CSV
+
+raw_data <- read_csv(raw_path, show_col_types = FALSE) %>% clean_names()
+cat("Raw dimensions:", paste(dim(raw_data), collapse = " x "), "\n")
+glimpse(raw_data)
+
+if (!file.exists(raw_path)) {
+  stop(
+    "Couldn't find '", raw_path, "' (current working directory: '", getwd(), "').\n",
+    "Set 'raw_path' above to the full path of your CSV, e.g.:\n",
+    "  raw_path <- \"C:/Users/Administrator/Downloads/Bank Customer Churn Prediction.csv\"\n",
+    "Also make sure this project folder has been extracted to disk — running\n",
+    "scripts directly from inside a .zip file won't work with setwd()."
+  )
+}
+
+raw_data <- read_csv(raw_path, show_col_types = FALSE) %>% clean_names()
+cat("Raw dimensions:", paste(dim(raw_data), collapse = " x "), "\n")
+glimpse(raw_data)
+
+expected_cols <- c("customer_id", "credit_score", "country", "gender", "age",
+                   "tenure", "balance", "products_number", "credit_card",
+                   "active_member", "estimated_salary", "churn")
+missing_cols <- setdiff(expected_cols, names(raw_data))
+if (length(missing_cols) > 0) {
+  stop("Expected column(s) not found in raw data: ", paste(missing_cols, collapse = ", "))
+}
+
+cat("Duplicate customer_id rows:", sum(duplicated(raw_data$customer_id)), "\n")
+
+data <- raw_data %>%
+  distinct(customer_id, .keep_all = TRUE) %>%
+  mutate(
+    credit_score      = as.numeric(gsub(",", "", credit_score)),
+    balance           = as.numeric(gsub(",", "", balance)),
+    estimated_salary  = as.numeric(gsub(",", "", estimated_salary)),
+    age               = as.numeric(age),
+    tenure            = as.numeric(tenure),
+    products_number   = as.numeric(products_number),
+    gender            = factor(gender, levels = c("Male", "Female")),
+    country           = factor(country),
+    has_cr_card       = factor(credit_card,   levels = c(0, 1), labels = c("No", "Yes")),
+    is_active         = factor(active_member, levels = c(0, 1), labels = c("No", "Yes")),
+    churn             = factor(churn,         levels = c(0, 1), labels = c("No", "Yes"))
+  ) %>%
+  select(customer_id, credit_score, country, gender, age, tenure, balance,
+         products_number, has_cr_card, is_active, estimated_salary, churn)
+
+missing_summary <- data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  filter(n_missing > 0)
+cat("\nMissing values before imputation:\n"); print(missing_summary)
+
+impute_col <- function(x) {
+  if (is.numeric(x)) {
+    x[is.na(x)] <- median(x, na.rm = TRUE)
+  } else if (is.factor(x)) {
+    x[is.na(x)] <- names(sort(table(x), decreasing = TRUE))[1]
+  }
+  x
+}
+data <- data %>% mutate(across(everything(), impute_col))
+stopifnot(sum(is.na(data)) == 0)
+
+data <- data %>%
+  mutate(
+    age_group    = cut(age, breaks = c(17, 30, 50, 100), labels = c("<30", "30-50", ">50")),
+    tenure_group = cut(tenure, breaks = c(-1, 2, 5, 10), labels = c("0-2 yrs", "3-5 yrs", "6-10 yrs")),
+    salary_flag_zero_balance = balance == 0
+  )
+
+cat("\nFinal cleaned dimensions:", paste(dim(data), collapse = " x "), "\n")
+cat("Churn rate:", round(mean(data$churn == "Yes") * 100, 2), "%\n")
+
+saveRDS(data, "data/processed/churn_clean.rds")
+write_csv(data, "data/processed/churn_clean.csv")
+```
+
+```{r}
+# ==============================================================================
+# 2. EXPLORATORY DATA ANALYSIS
+# ==============================================================================
+
+churn_colors <- c(No = "#4C72B0", Yes = "#C44E52")
+
+# --- Overall churn: donut chart ---
+overall_df <- data %>% count(churn) %>% mutate(pct = n / sum(n), ymax = cumsum(pct), ymin = lag(ymax, default = 0))
+p_donut <- ggplot(overall_df, aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 3, fill = churn)) +
+  geom_rect(color = "white") +
+  coord_polar(theta = "y") + xlim(c(2, 4)) +
+  scale_fill_manual(values = churn_colors) +
+  geom_text(aes(x = 3.5, y = (ymin + ymax) / 2, label = percent(pct, accuracy = 0.1)), color = "white", size = 5) +
+  labs(title = "Overall Churn Rate", fill = "Churned") +
+  theme_void() + theme(plot.background = element_rect(fill = "white", color = NA), legend.position = "right")
+save_plot(p_donut, "01_overall_churn_donut")
+
+# --- Age distribution by churn ---
+p_age_dist <- ggplot(data, aes(age, fill = churn)) +
+  geom_histogram(bins = 30, alpha = 0.75, position = "identity") +
+  scale_fill_manual(values = churn_colors) +
+  labs(title = "Age Distribution by Churn", x = "Age", y = "Customers", fill = "Churned")
+save_plot(p_age_dist, "02_age_distribution")
+
+# --- Churn rate by age group ---
+p_age <- data %>% group_by(age_group) %>% summarise(churn_rate = mean(churn == "Yes") * 100) %>%
+  ggplot(aes(age_group, churn_rate)) + geom_col(fill = "#4C72B0") +
+  labs(title = "Churn Rate by Age Group", x = "Age Group", y = "Churn Rate (%)")
+save_plot(p_age, "03_churn_by_age_group")
+
+# --- Churn rate by gender ---
+p_gender <- data %>% group_by(gender) %>% summarise(churn_rate = mean(churn == "Yes") * 100) %>%
+  ggplot(aes(gender, churn_rate)) + geom_col(fill = "#DD8452") +
+  labs(title = "Churn Rate by Gender", x = "Gender", y = "Churn Rate (%)")
+save_plot(p_gender, "04_churn_by_gender")
+
+# --- Churn rate by country ---
+p_geo <- data %>% group_by(country) %>% summarise(churn_rate = mean(churn == "Yes") * 100) %>%
+  ggplot(aes(reorder(country, -churn_rate), churn_rate)) + geom_col(fill = "#55A868") +
+  labs(title = "Churn Rate by Country", x = "Country", y = "Churn Rate (%)")
+save_plot(p_geo, "05_churn_by_country")
+
+# --- Churn rate by country and gender (stacked) ---
+p_geo_gender <- data %>% group_by(country, gender) %>% summarise(churn_rate = mean(churn == "Yes") * 100, .groups = "drop") %>%
+  ggplot(aes(country, churn_rate, fill = gender)) + geom_col(position = "dodge") +
+  labs(title = "Churn Rate by Country & Gender", x = "Country", y = "Churn Rate (%)", fill = "Gender")
+save_plot(p_geo_gender, "06_churn_by_country_gender")
+
+# --- Churn rate by number of products ---
+p_product <- data %>% group_by(products_number) %>% summarise(churn_rate = mean(churn == "Yes") * 100) %>%
+  ggplot(aes(factor(products_number), churn_rate)) + geom_col(fill = "#8172B2") +
+  labs(title = "Churn Rate by Number of Products", x = "Number of Products", y = "Churn Rate (%)")
+save_plot(p_product, "07_churn_by_products")
+
+# --- Churn rate by activity status ---
+p_active <- data %>% group_by(is_active) %>% summarise(churn_rate = mean(churn == "Yes") * 100) %>%
+  ggplot(aes(is_active, churn_rate)) + geom_col(fill = "#CCB974") +
+  labs(title = "Churn Rate by Active Member Status", x = "Active Member", y = "Churn Rate (%)")
+save_plot(p_active, "08_churn_by_active_status")
+
+# --- Churn rate by tenure group ---
+p_tenure <- data %>% group_by(tenure_group) %>% summarise(churn_rate = mean(churn == "Yes") * 100) %>%
+  ggplot(aes(tenure_group, churn_rate)) + geom_col(fill = "#64B5CD") +
+  labs(title = "Churn Rate by Tenure Group", x = "Tenure", y = "Churn Rate (%)")
+save_plot(p_tenure, "09_churn_by_tenure")
+
+# --- Churn rate by credit card ownership ---
+p_cc <- data %>% group_by(has_cr_card) %>% summarise(churn_rate = mean(churn == "Yes") * 100) %>%
+  ggplot(aes(has_cr_card, churn_rate)) + geom_col(fill = "#00ACC1") +
+  labs(title = "Churn Rate by Credit Card Ownership", x = "Has Credit Card", y = "Churn Rate (%)")
+save_plot(p_cc, "10_churn_by_credit_card")
+
+# --- Salary by churn (boxplot) ---
+p_salary_box <- ggplot(data, aes(churn, estimated_salary, fill = churn)) + geom_boxplot() +
+  scale_fill_manual(values = churn_colors) +
+  labs(title = "Estimated Salary by Churn Status", x = "Churned", y = "Estimated Salary") + theme(legend.position = "none")
+save_plot(p_salary_box, "11_salary_by_churn")
+
+# --- Balance by churn (violin) ---
+p_balance_violin <- ggplot(data, aes(churn, balance, fill = churn)) + geom_violin() +
+  scale_fill_manual(values = churn_colors) +
+  labs(title = "Account Balance Distribution by Churn", x = "Churned", y = "Balance") + theme(legend.position = "none")
+save_plot(p_balance_violin, "12_balance_by_churn_violin")
+
+# --- Credit score density by churn ---
+p_credit_density <- ggplot(data, aes(credit_score, fill = churn)) + geom_density(alpha = 0.6) +
+  scale_fill_manual(values = churn_colors) +
+  labs(title = "Credit Score Density by Churn", x = "Credit Score", y = "Density", fill = "Churned")
+save_plot(p_credit_density, "13_credit_score_density")
+
+# --- Age vs balance scatter, colored by churn ---
+p_scatter <- ggplot(data, aes(age, balance, color = churn)) + geom_jitter(alpha = 0.35, size = 1) +
+  scale_color_manual(values = churn_colors) +
+  labs(title = "Age vs. Balance by Churn", x = "Age", y = "Balance", color = "Churned")
+save_plot(p_scatter, "14_age_vs_balance_scatter")
+
+# --- Correlation heatmap ---
+numeric_data <- data %>% mutate(churn_num = as.numeric(churn == "Yes")) %>% select(where(is.numeric), -customer_id)
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+save_base_plot(
+  corrplot(cor_matrix, method = "color", type = "upper", order = "hclust",
+           addCoef.col = "black", number.cex = 0.6, tl.col = "black", tl.srt = 45,
+           col = colorRampPalette(c("#4C72B0", "white", "#C44E52"))(200),
+           bg = "white", title = "Correlation Matrix (incl. churn)", mar = c(0, 0, 1, 0)),
+  "15_correlation_matrix.png"
+)
+
+churn_cor_df <- tibble(feature = names(cor_matrix[, "churn_num"]), correlation = cor_matrix[, "churn_num"]) %>%
+  filter(feature != "churn_num") %>% arrange(desc(abs(correlation)))
+write_csv(churn_cor_df, "outputs/tables/correlation_with_churn.csv")
+
+cat("EDA complete.\n")
+```
+
+```{r}
+# ==============================================================================
+# 3. MODELING & EVALUATION
+# ==============================================================================
+
+model_data <- data %>% select(-customer_id, -age_group, -tenure_group)
+
+train_index <- createDataPartition(model_data$churn, p = 0.7, list = FALSE)
+train_data  <- model_data[train_index, ]
+test_data   <- model_data[-train_index, ]
+
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE,
+                      summaryFunction = twoClassSummary, savePredictions = "final")
+
+roc_list <- list()
+cm_list  <- list()
+
+model_rf <- train(churn ~ ., data = train_data, method = "rf", trControl = ctrl, metric = "ROC", tuneLength = 3)
+pred_rf  <- predict(model_rf, test_data)
+prob_rf  <- predict(model_rf, test_data, type = "prob")[, "Yes"]
+cm_list$`Random Forest` <- confusionMatrix(pred_rf, test_data$churn, positive = "Yes")
+roc_list$`Random Forest` <- roc(test_data$churn, prob_rf, quiet = TRUE, levels = c("No", "Yes"), direction = "<")
+
+model_xgb <- train(churn ~ ., data = train_data, method = "xgbTree", trControl = ctrl, metric = "ROC", tuneLength = 2, verbosity = 0)
+pred_xgb  <- predict(model_xgb, test_data)
+prob_xgb  <- predict(model_xgb, test_data, type = "prob")[, "Yes"]
+cm_list$XGBoost <- confusionMatrix(pred_xgb, test_data$churn, positive = "Yes")
+roc_list$XGBoost <- roc(test_data$churn, prob_xgb, quiet = TRUE, levels = c("No", "Yes"), direction = "<")
+
+model_tree <- train(churn ~ ., data = train_data, method = "rpart", trControl = ctrl, metric = "ROC", tuneLength = 3)
+pred_tree  <- predict(model_tree, test_data)
+prob_tree  <- predict(model_tree, test_data, type = "prob")[, "Yes"]
+cm_list$`Decision Tree` <- confusionMatrix(pred_tree, test_data$churn, positive = "Yes")
+roc_list$`Decision Tree` <- roc(test_data$churn, prob_tree, quiet = TRUE, levels = c("No", "Yes"), direction = "<")
+
+model_log <- train(churn ~ ., data = train_data, method = "glm", family = "binomial", trControl = ctrl, metric = "ROC")
+pred_log  <- predict(model_log, test_data)
+prob_log  <- predict(model_log, test_data, type = "prob")[, "Yes"]
+cm_list$`Logistic Regression` <- confusionMatrix(pred_log, test_data$churn, positive = "Yes")
+roc_list$`Logistic Regression` <- roc(test_data$churn, prob_log, quiet = TRUE, levels = c("No", "Yes"), direction = "<")
+
+model_knn <- train(churn ~ ., data = train_data, method = "knn", trControl = ctrl, metric = "ROC", tuneLength = 5, preProcess = c("center", "scale"))
+pred_knn  <- predict(model_knn, test_data)
+prob_knn  <- predict(model_knn, test_data, type = "prob")[, "Yes"]
+cm_list$KNN <- confusionMatrix(pred_knn, test_data$churn, positive = "Yes")
+roc_list$KNN <- roc(test_data$churn, prob_knn, quiet = TRUE, levels = c("No", "Yes"), direction = "<")
+
+extract_metrics <- function(cm, model_name, auc_val) {
+  tibble(Model = model_name, Accuracy = cm$overall[["Accuracy"]], Kappa = cm$overall[["Kappa"]],
+         Sensitivity = cm$byClass[["Sensitivity"]], Specificity = cm$byClass[["Specificity"]],
+         Balanced_Accuracy = cm$byClass[["Balanced Accuracy"]], AUC = auc_val)
+}
+
+metrics_df <- bind_rows(lapply(names(cm_list), function(m) {
+  extract_metrics(cm_list[[m]], m, as.numeric(auc(roc_list[[m]])))
+})) %>% arrange(desc(AUC))
+
+print(metrics_df)
+write_csv(metrics_df, "outputs/tables/model_comparison.csv")
+
+p_compare <- metrics_df %>% pivot_longer(-Model, names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(Model, Value, fill = Metric)) + geom_col(position = "dodge") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Model Performance Comparison", x = NULL, y = "Score") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) + scale_fill_brewer(palette = "Set2")
+save_plot(p_compare, "16_model_comparison", width = 9, height = 5.5)
+
+save_base_plot({
+  plot(roc_list[[1]], col = 1, main = "ROC Curves — All Models")
+  for (i in seq_along(roc_list)[-1]) plot(roc_list[[i]], col = i, add = TRUE)
+  legend("bottomright", legend = paste0(names(roc_list), " (AUC=",
+         round(sapply(roc_list, function(r) as.numeric(auc(r))), 3), ")"),
+         col = seq_along(roc_list), lwd = 2, cex = 0.8)
+}, "17_roc_curves.png")
+
+# --- Confusion matrix heatmaps, all 5 models ---
+plot_confusion <- function(cm, model_name) {
+  df <- as.data.frame(cm$table)
+  colnames(df) <- c("Prediction", "Actual", "Freq")
+  ggplot(df, aes(Actual, Prediction, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 4) +
+    scale_fill_gradient(low = "#EAF2FB", high = "#4C72B0") +
+    labs(title = model_name, x = "Actual", y = "Predicted") +
+    theme(legend.position = "none")
+}
+cm_plots <- lapply(names(cm_list), function(m) plot_confusion(cm_list[[m]], m))
+p_confusion_grid <- wrap_plots(cm_plots, ncol = 3) +
+  plot_annotation(title = "Confusion Matrices — All Models")
+save_plot(p_confusion_grid, "18_confusion_matrices", width = 12, height = 7)
+
+best_model_name <- metrics_df$Model[1]
+cat("Best model by AUC:", best_model_name, "\n")
+
+models_lookup <- list("Random Forest" = model_rf, "XGBoost" = model_xgb,
+                       "Decision Tree" = model_tree, "Logistic Regression" = model_log, "KNN" = model_knn)
+best_model <- models_lookup[[best_model_name]]
+
+saveRDS(models_lookup, "models/all_models.rds")
+saveRDS(best_model,    "models/best_model.rds")
+saveRDS(metrics_df, "models/model_comparison.rds")
+
+imp <- tryCatch(varImp(best_model)$importance, error = function(e) NULL)
+if (!is.null(imp)) {
+  imp_df <- imp %>% rownames_to_column("Feature")
+  names(imp_df)[2] <- "Importance"
+  imp_df <- imp_df %>% arrange(desc(Importance)) %>% head(15)
+  p_imp <- ggplot(imp_df, aes(reorder(Feature, Importance), Importance)) +
+    geom_col(fill = "forestgreen") + coord_flip() +
+    labs(title = paste("Feature Importance —", best_model_name), x = "Feature", y = "Importance")
+  save_plot(p_imp, "19_feature_importance")
+}
+```
+
+```{r}
+# ==============================================================================
+# 4. PREDICTIVE RISK SCORING
+# ==============================================================================
+
+model_input <- data %>% select(-customer_id, -age_group, -tenure_group)
+risk_prob <- predict(best_model, model_input, type = "prob")[, "Yes"]
+
+risk_scores <- data %>%
+  transmute(customer_id, country, gender, age, tenure, balance, products_number,
+            has_cr_card, is_active, estimated_salary,
+            actual_churn = churn, churn_probability = round(risk_prob, 4)) %>%
+  mutate(risk_tier = factor(case_when(
+    churn_probability >= 0.70 ~ "High",
+    churn_probability >= 0.40 ~ "Medium",
+    TRUE ~ "Low"
+  ), levels = c("Low", "Medium", "High"))) %>%
+  arrange(desc(churn_probability))
+
+write_csv(risk_scores, "outputs/tables/customer_risk_scores.csv")
+
+p_dist <- ggplot(risk_scores, aes(churn_probability, fill = risk_tier)) +
+  geom_histogram(bins = 30, boundary = 0) +
+  scale_fill_manual(values = c(Low = "#55A868", Medium = "#DD8452", High = "#C44E52")) +
+  labs(title = "Predicted Churn Risk Distribution", x = "Predicted Churn Probability",
+       y = "Customers", fill = "Risk Tier")
+save_plot(p_dist, "20_risk_distribution")
+
+lift_table <- risk_scores %>%
+  mutate(decile = ntile(desc(churn_probability), 10)) %>%
+  group_by(decile) %>%
+  summarise(n_customers = n(), n_actual_churn = sum(actual_churn == "Yes"),
+            churn_rate = round(mean(actual_churn == "Yes") * 100, 2)) %>%
+  arrange(decile) %>%
+  mutate(cumulative_churn_captured = round(cumsum(n_actual_churn) / sum(n_actual_churn) * 100, 1))
+
+write_csv(lift_table, "outputs/tables/lift_table.csv")
+
+p_lift <- ggplot(lift_table, aes(decile, cumulative_churn_captured)) +
+  geom_line(color = "#4C72B0", linewidth = 1) + geom_point(color = "#4C72B0", size = 2) +
+  geom_abline(intercept = 10, slope = 10, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "Cumulative Lift Chart", subtitle = "Dashed line = random targeting baseline",
+       x = "Risk Decile (1 = highest risk)", y = "% of Churners Captured")
+save_plot(p_lift, "21_lift_chart")
+
+cat("Targeting decile 1 alone captures", lift_table$cumulative_churn_captured[1], "% of all churners.\n")
+```
+
+```{r}
+# ==============================================================================
+# 5. EXECUTIVE DASHBOARD (single combined visual)
+# ==============================================================================
+panel_theme <- theme(
+  plot.title   = element_text(size = 11, face = "bold"),
+  legend.position = "bottom",
+  legend.title = element_text(size = 8),
+  legend.text  = element_text(size = 7),
+  plot.margin  = ggplot2::margin(10, 14, 10, 10)
+)
+
+dashboard <- (p_donut + panel_theme) + (p_geo + panel_theme) + (p_age + panel_theme) +
+  (p_compare + panel_theme) + (p_dist + panel_theme) + (p_lift + panel_theme) +
+  plot_layout(ncol = 3, guides = "collect") +
+  plot_annotation(
+    title = "Bank Customer Churn — Executive Dashboard",
+    subtitle = paste0("Total customers: ", nrow(data),
+                       "  |  Churn rate: ", round(mean(data$churn == "Yes") * 100, 1), "%",
+                       "  |  Best model: ", best_model_name,
+                       " (AUC ", round(max(metrics_df$AUC), 3), ")"),
+    theme = theme(plot.title = element_text(size = 18, face = "bold"),
+                  plot.subtitle = element_text(size = 12),
+                  plot.background = element_rect(fill = "white", color = NA))
+  ) &
+  theme(legend.position = "bottom",
+        plot.background = element_rect(fill = "white", color = NA))
+
+save_plot(dashboard, "00_executive_dashboard", width = 18, height = 11)
+cat("\nPipeline complete. Figures in outputs/figures/, tables in outputs/tables/, models in models/.\n")
+cat("Launch the interactive dashboard with: shiny::runApp('dashboard')\n")
+```
