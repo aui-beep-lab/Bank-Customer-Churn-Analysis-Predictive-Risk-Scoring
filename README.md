@@ -1,4 +1,4 @@
-# Bank Customer Churn — Prediction, EDA & Risk-Scoring Dashboard
+# Bank Customer Churn: Prediction, EDA & Risk-Scoring Dashboard
 
 End-to-end churn analytics project in R, built around the CRISP-DM framework:
 data cleaning → exploratory analysis → multi-model classification → predictive
